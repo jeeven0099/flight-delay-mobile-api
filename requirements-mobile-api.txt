@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+requests
+numpy
+pandas
+pyarrow
+torch
+torch-geometric

@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: flight-delay-mobile-api
+    runtime: docker
+    dockerfilePath: ./Dockerfile.mobile-api
+    plan: free
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: AVIATIONSTACK_KEY
+        sync: false
+      - key: MODEL_URL
+        sync: false
