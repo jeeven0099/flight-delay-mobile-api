@@ -1,4 +1,3 @@
 .env
 checkpoints/
-*.pt
 __pycache__/
