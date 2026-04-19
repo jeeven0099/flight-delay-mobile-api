@@ -50,6 +50,10 @@ AIRPORT_FEATURE_DIM = 30
 FLIGHT_FEATURE_DIM = 19
 
 
+def log_event(message: str) -> None:
+    print(f"[mobile-api] {message}", flush=True)
+
+
 def load_module(module_name: str, file_path: Path):
     spec = spec_from_file_location(module_name, str(file_path))
     if spec is None or spec.loader is None:
@@ -61,6 +65,7 @@ def load_module(module_name: str, file_path: Path):
 
 def ensure_checkpoint_present(ckpt_path: Path) -> None:
     if ckpt_path.exists():
+        log_event(f"checkpoint already present: {ckpt_path.name}")
         return
     if not MODEL_URL:
         raise RuntimeError(
@@ -70,7 +75,7 @@ def ensure_checkpoint_present(ckpt_path: Path) -> None:
 
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = ckpt_path.with_suffix(ckpt_path.suffix + ".part")
-    print(f"[startup] downloading checkpoint from MODEL_URL -> {ckpt_path.name}")
+    log_event(f"downloading checkpoint from MODEL_URL -> {ckpt_path.name}")
 
     try:
         with requests.get(MODEL_URL, stream=True, timeout=60) as resp:
@@ -80,6 +85,7 @@ def ensure_checkpoint_present(ckpt_path: Path) -> None:
                     if chunk:
                         fh.write(chunk)
         shutil.move(str(tmp_path), str(ckpt_path))
+        log_event(f"checkpoint download complete: {ckpt_path.name}")
     except Exception:
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
@@ -267,8 +273,11 @@ class LoadedAssets:
 def load_assets() -> LoadedAssets:
     device = torch.device("cpu")
     ckpt_path = CHECKPOINT_DIR / CHECKPOINT_NAME
+    log_event("load_assets: start")
     ensure_checkpoint_present(ckpt_path)
+    log_event("load_assets: torch.load checkpoint")
     ck = torch.load(ckpt_path, map_location=device, weights_only=False)
+    log_event("load_assets: checkpoint loaded")
 
     if ck.get("ordinal_thresholds") is not None:
         dash_mod.ORDINAL_THRESHOLDS = [float(x) for x in ck["ordinal_thresholds"]]
@@ -288,8 +297,10 @@ def load_assets() -> LoadedAssets:
     airport_df = pd.read_parquet(GRAPH_DATA_DIR / "airport_index.parquet")
     airports = airport_df["airport"].tolist()
     airport_index = {ap: i for i, ap in enumerate(airports)}
+    log_event(f"load_assets: airport index loaded ({len(airports)} airports)")
 
     static = torch.load(GRAPH_DATA_DIR / "static_edges.pt", map_location=device, weights_only=False)
+    log_event("load_assets: static edges loaded")
 
     route_stats = None
     rs_path = GRAPH_DATA_DIR / "route_stats.parquet"
@@ -332,11 +343,14 @@ def load_assets() -> LoadedAssets:
         tail_uplift_thresholds=dash_mod.TAIL_UPLIFT_THRESHOLDS,
         tail_uplift_detach_gates=tail_uplift_detach_gates,
     ).to(device)
+    log_event("load_assets: model constructed")
     model.load_state_dict(ck["model_state"])
     model.eval()
+    log_event("load_assets: model_state loaded and model set to eval")
 
     del ck
     gc.collect()
+    log_event("load_assets: gc complete")
 
     ordinal_thresholds = [float(x) for x in dash_mod.ORDINAL_THRESHOLDS]
     severe_idx = ordinal_thresholds.index(120.0) if 120.0 in ordinal_thresholds else max(len(ordinal_thresholds) - 1, 0)
@@ -369,9 +383,12 @@ def get_assets() -> LoadedAssets:
             _MODEL_LOADING = True
             _MODEL_ERROR = None
             try:
+                log_event("get_assets: starting lazy model load")
                 _ASSETS = load_assets()
+                log_event("get_assets: lazy model load complete")
             except Exception as exc:
                 _MODEL_ERROR = str(exc)
+                log_event(f"get_assets: lazy model load failed: {_MODEL_ERROR}")
                 raise
             finally:
                 _MODEL_LOADING = False
@@ -594,12 +611,16 @@ def airports():
 
 @app.post("/warmup")
 def warmup():
+    log_event("warmup: request received")
     if _ASSETS is not None:
+        log_event("warmup: model already ready")
         return {"status": "ready", "checkpoint": CHECKPOINT_NAME}
     try:
         get_assets()
+        log_event("warmup: model ready")
         return {"status": "ready", "checkpoint": CHECKPOINT_NAME}
     except Exception as exc:
+        log_event(f"warmup: failed: {exc}")
         raise HTTPException(status_code=503, detail=f"Model warmup failed: {exc}") from exc
 
 
