@@ -247,6 +247,9 @@ class HealthResponse(BaseModel):
     status: str
     checkpoint: str
     aviationstack_enabled: bool
+    model_loaded: bool
+    model_loading: bool
+    model_error: str | None = None
 
 
 @dataclass
@@ -351,17 +354,27 @@ def load_assets() -> LoadedAssets:
 
 _ASSETS: LoadedAssets | None = None
 _ASSETS_LOCK = threading.Lock()
+_MODEL_LOADING = False
+_MODEL_ERROR: str | None = None
 
 app = FastAPI(title="Flight Delay Mobile API", version="1.0.0")
 
 
 def get_assets() -> LoadedAssets:
-    global _ASSETS
+    global _ASSETS, _MODEL_LOADING, _MODEL_ERROR
     if _ASSETS is not None:
         return _ASSETS
     with _ASSETS_LOCK:
         if _ASSETS is None:
-            _ASSETS = load_assets()
+            _MODEL_LOADING = True
+            _MODEL_ERROR = None
+            try:
+                _ASSETS = load_assets()
+            except Exception as exc:
+                _MODEL_ERROR = str(exc)
+                raise
+            finally:
+                _MODEL_LOADING = False
     return _ASSETS
 
 
@@ -553,6 +566,9 @@ def health():
         status="ok",
         checkpoint=CHECKPOINT_NAME,
         aviationstack_enabled=bool(AVIATIONSTACK_KEY),
+        model_loaded=_ASSETS is not None,
+        model_loading=_MODEL_LOADING,
+        model_error=_MODEL_ERROR,
     )
 
 
@@ -563,6 +579,8 @@ def root():
         "status": "ok",
         "checkpoint": CHECKPOINT_NAME,
         "model_loaded": _ASSETS is not None,
+        "model_loading": _MODEL_LOADING,
+        "model_error": _MODEL_ERROR,
     }
 
 
@@ -572,6 +590,17 @@ def airports():
         {"code": ap, "name": AIRPORT_NAMES.get(ap, ap)}
         for ap in sorted(AIRPORTS)
     ]
+
+
+@app.post("/warmup")
+def warmup():
+    if _ASSETS is not None:
+        return {"status": "ready", "checkpoint": CHECKPOINT_NAME}
+    try:
+        get_assets()
+        return {"status": "ready", "checkpoint": CHECKPOINT_NAME}
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Model warmup failed: {exc}") from exc
 
 
 @app.post("/predict-flight")
@@ -602,17 +631,20 @@ def predict_flight(req: FlightSearchRequest):
         destination: fetch_nws_weather(destination),
     }
 
-    horizons = [
-        run_horizon_prediction(
-            origin,
-            destination,
-            dep_dt,
-            hours_before=h,
-            dep_delay=live_dep_delay,
-            weather_map=weather_map,
-        )
-        for h in [6, 3, 1]
-    ]
+    try:
+        horizons = [
+            run_horizon_prediction(
+                origin,
+                destination,
+                dep_dt,
+                hours_before=h,
+                dep_delay=live_dep_delay,
+                weather_map=weather_map,
+            )
+            for h in [6, 3, 1]
+        ]
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Prediction unavailable: {exc}") from exc
 
     summary = {
         "max_predicted_delay_min": max(h["predicted_delay_min"] for h in horizons),
