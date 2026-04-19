@@ -18,8 +18,10 @@ Then point the iOS app at:
 
 from __future__ import annotations
 
+import gc
 import os
 import shutil
+import threading
 from dataclasses import dataclass
 from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
@@ -330,6 +332,9 @@ def load_assets() -> LoadedAssets:
     model.load_state_dict(ck["model_state"])
     model.eval()
 
+    del ck
+    gc.collect()
+
     ordinal_thresholds = [float(x) for x in dash_mod.ORDINAL_THRESHOLDS]
     severe_idx = ordinal_thresholds.index(120.0) if 120.0 in ordinal_thresholds else max(len(ordinal_thresholds) - 1, 0)
     return LoadedAssets(
@@ -344,9 +349,20 @@ def load_assets() -> LoadedAssets:
     )
 
 
-ASSETS = load_assets()
+_ASSETS: LoadedAssets | None = None
+_ASSETS_LOCK = threading.Lock()
 
 app = FastAPI(title="Flight Delay Mobile API", version="1.0.0")
+
+
+def get_assets() -> LoadedAssets:
+    global _ASSETS
+    if _ASSETS is not None:
+        return _ASSETS
+    with _ASSETS_LOCK:
+        if _ASSETS is None:
+            _ASSETS = load_assets()
+    return _ASSETS
 
 
 def fetch_live_flight_details(flight_number: str, flight_date: str, origin: str, destination: str) -> dict[str, Any] | None:
@@ -403,7 +419,7 @@ def fetch_live_flight_details(flight_number: str, flight_date: str, origin: str,
 
 def validate_airport(code: str) -> str:
     code = (code or "").upper().strip()
-    if code not in ASSETS.airport_index:
+    if code not in AIRPORTS:
         raise HTTPException(status_code=400, detail=f"Unsupported airport: {code}")
     return code
 
@@ -423,12 +439,13 @@ def build_single_snapshot(
     dep_delay: float,
     weather_map: dict[str, dict[str, float]],
 ) -> HeteroData:
+    assets = get_assets()
     snap_time = dep_dt - pd.Timedelta(hours=hours_before)
     h2dep = float(hours_before)
     dow = dep_dt.dayofweek
     dep_hour = dep_dt.hour
 
-    X_ap = build_airport_features_simple(ASSETS.airport_index, weather_map, snap_time)
+    X_ap = build_airport_features_simple(assets.airport_index, weather_map, snap_time)
     X_ap_t = torch.tensor(X_ap, dtype=torch.float16)
 
     X_fl = build_flight_features_single(
@@ -437,26 +454,26 @@ def build_single_snapshot(
         dep_hour,
         dow,
         h2dep,
-        ASSETS.route_stats,
+        assets.route_stats,
         dep_delay if hours_before == 1 else 0.0,
     )
     X_fl_t = torch.tensor(X_fl, dtype=torch.float16).unsqueeze(0)
     X_fl_t = dash_mod.apply_masking(X_fl_t)
 
-    cg_ei = ASSETS.static["congestion_ei"].to(ASSETS.device)
-    cg_ea = ASSETS.static.get("congestion_ea")
-    cg_ea = cg_ea.to(ASSETS.device) if cg_ea is not None else torch.zeros((0, 1), dtype=torch.float, device=ASSETS.device)
-    nw_ei = ASSETS.static["network_ei"].to(ASSETS.device)
-    nw_ea = ASSETS.static["network_ea"].to(ASSETS.device)
+    cg_ei = assets.static["congestion_ei"].to(assets.device)
+    cg_ea = assets.static.get("congestion_ea")
+    cg_ea = cg_ea.to(assets.device) if cg_ea is not None else torch.zeros((0, 1), dtype=torch.float, device=assets.device)
+    nw_ei = assets.static["network_ei"].to(assets.device)
+    nw_ea = assets.static["network_ea"].to(assets.device)
 
-    origin_idx = ASSETS.airport_index.get(origin, 0)
-    dest_idx = ASSETS.airport_index.get(destination, 0)
+    origin_idx = assets.airport_index.get(origin, 0)
+    dest_idx = assets.airport_index.get(destination, 0)
 
     snap = HeteroData()
     snap["airport"].x = X_ap_t
-    snap["airport"].num_nodes = len(ASSETS.airports)
-    snap["airport"].y = torch.zeros(len(ASSETS.airports))
-    snap["airport"].y_mask = torch.zeros(len(ASSETS.airports), dtype=torch.bool)
+    snap["airport"].num_nodes = len(assets.airports)
+    snap["airport"].y = torch.zeros(len(assets.airports))
+    snap["airport"].y_mask = torch.zeros(len(assets.airports), dtype=torch.bool)
 
     snap["flight"].x = X_fl_t
     snap["flight"].num_nodes = 1
@@ -482,7 +499,7 @@ def build_single_snapshot(
     snap["flight", "arrives_at", "airport"].edge_index = torch.tensor([[0], [dest_idx]], dtype=torch.long)
     snap["flight", "arrives_at", "airport"].edge_attr = torch.zeros((1, 1))
 
-    return snap.to(ASSETS.device)
+    return snap.to(assets.device)
 
 
 def run_horizon_prediction(
@@ -493,11 +510,12 @@ def run_horizon_prediction(
     dep_delay: float,
     weather_map: dict[str, dict[str, float]],
 ) -> dict[str, Any]:
+    assets = get_assets()
     snap = build_single_snapshot(origin, destination, dep_dt, hours_before, dep_delay, weather_map)
-    ap_h, tail_h = ASSETS.model.init_hidden(ASSETS.device)
+    ap_h, tail_h = assets.model.init_hidden(assets.device)
 
     with torch.no_grad():
-        fl_pred, fl_logits, _, _ = ASSETS.model(snap, ap_h, tail_h)
+        fl_pred, fl_logits, _, _ = assets.model(snap, ap_h, tail_h)
 
     pred_delay = float(fl_pred[0].item()) if len(fl_pred) else 0.0
     if fl_logits.ndim == 1:
@@ -505,8 +523,8 @@ def run_horizon_prediction(
         bucket_probs = None
     else:
         raw_probs = torch.sigmoid(fl_logits[0]).cpu().numpy()
-        severe_prob = float(raw_probs[ASSETS.severe_idx])
-        bucket_probs = dash_mod.ordinal_bucket_probs(raw_probs[: len(ASSETS.ordinal_thresholds)])
+        severe_prob = float(raw_probs[assets.severe_idx])
+        bucket_probs = dash_mod.ordinal_bucket_probs(raw_probs[: len(assets.ordinal_thresholds)])
 
     tier = tier_label(pred_delay)
     code = tier_code(pred_delay)
@@ -544,6 +562,7 @@ def root():
         "service": "flight-delay-mobile-api",
         "status": "ok",
         "checkpoint": CHECKPOINT_NAME,
+        "model_loaded": _ASSETS is not None,
     }
 
 
@@ -552,7 +571,6 @@ def airports():
     return [
         {"code": ap, "name": AIRPORT_NAMES.get(ap, ap)}
         for ap in sorted(AIRPORTS)
-        if ap in ASSETS.airport_index
     ]
 
 
@@ -571,9 +589,9 @@ def predict_flight(req: FlightSearchRequest):
             destination,
         )
         if live_flight:
-            if live_flight.get("origin") in ASSETS.airport_index:
+            if live_flight.get("origin") in AIRPORTS:
                 origin = live_flight["origin"]
-            if live_flight.get("destination") in ASSETS.airport_index:
+            if live_flight.get("destination") in AIRPORTS:
                 destination = live_flight["destination"]
             if live_flight.get("scheduled_departure"):
                 dep_dt = pd.Timestamp(live_flight["scheduled_departure"])
@@ -617,7 +635,7 @@ def predict_flight(req: FlightSearchRequest):
         "model": {
             "checkpoint": CHECKPOINT_NAME,
             "severe_alert_threshold": SEVERE_ALERT_THRESHOLD,
-            "ordinal_thresholds": ASSETS.ordinal_thresholds,
+            "ordinal_thresholds": get_assets().ordinal_thresholds,
         },
     }
 
